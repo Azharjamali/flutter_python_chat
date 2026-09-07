@@ -1,3 +1,6 @@
 venv/
 __pycache__/
 *.pyc
+usernames.json
+statuses.json
+status_media/

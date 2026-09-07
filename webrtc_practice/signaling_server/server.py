@@ -48,6 +48,7 @@ Every message sent over the WebSocket is a JSON object with a "type" field.
 
     "register"      - {device_id} - bind this socket to a device_id. Must be
                        the first message sent after connecting.
+    "open-chat"     - {peer_id} - open a 1:1 chat with another unique user id
     "join"          - {room, device_id} - add device_id to a room
     "leave"         - {room, device_id} - remove device_id from a room
     "chat"          - {room, device_id, msg_id, text, ts} - relayed as-is
@@ -61,7 +62,9 @@ Every message sent over the WebSocket is a JSON object with a "type" field.
     "ice-candidate" - ICE candidate, relayed as-is
 
 Server -> client only:
-    "joined"        - {room, member_count}
+    "registered"    - {device_id}
+    "joined"        - {room, member_count, peer_id, peer_online}
+    "chat-opened"   - {room, peer_id, peer_online} - someone started a chat with you
     "room-full"     - {room}
     "peer-status"   - {room, device_id, status: "online"|"offline"}
 
@@ -77,7 +80,14 @@ Run this file with:
 
 import asyncio
 import json
+import os
+import re
 import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Optional
+from urllib.parse import urlparse
 
 import websockets
 
@@ -86,7 +96,13 @@ import websockets
 HOST = "0.0.0.0"          # listen on all network interfaces (so phones on WiFi can connect)
 PORT = 8765                # port the WebSocket server listens on
 DISCOVERY_PORT = 8766      # port the UDP auto-discovery listener listens on
+HTTP_PORT = 8767           # status image/video upload and download
 MAX_CLIENTS_PER_ROOM = 2   # this is a 1-to-1 call app, so only 2 devices per room
+STATUS_TTL_MS = 24 * 60 * 60 * 1000
+SAFE_MEDIA_NAME = re.compile(r"^[a-zA-Z0-9._-]+$")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEDIA_DIR = os.path.join(_BASE_DIR, "status_media")
+STATUSES_FILE = os.path.join(_BASE_DIR, "statuses.json")
 
 # --- Server state ------------------------------------------------------------
 #
@@ -107,11 +123,183 @@ MAX_CLIENTS_PER_ROOM = 2   # this is a 1-to-1 call app, so only 2 devices per ro
 connected: dict[str, object] = {}
 rooms: dict[str, set[str]] = {}
 device_of: dict[object, str] = {}
+claimed_usernames: set = set()
+USERNAMES_FILE = os.path.join(_BASE_DIR, "usernames.json")
+statuses: dict = {}
 
 
-def rooms_of(device_id: str) -> list[str]:
+def load_claimed_usernames() -> None:
+    global claimed_usernames
+    try:
+        with open(USERNAMES_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            claimed_usernames = {str(name).strip().lower() for name in data if name}
+    except (OSError, json.JSONDecodeError):
+        claimed_usernames = set()
+
+
+def save_claimed_usernames() -> None:
+    with open(USERNAMES_FILE, "w", encoding="utf-8") as handle:
+        json.dump(sorted(claimed_usernames), handle)
+
+
+def normalize_username(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+USERNAME_RE = re.compile(r"^[a-z0-9_]{3,20}$")
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def load_statuses() -> None:
+    global statuses
+    try:
+        with open(STATUSES_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            statuses = data
+        elif isinstance(data, list):
+            statuses = {item["id"]: item for item in data if isinstance(item, dict) and item.get("id")}
+    except (OSError, json.JSONDecodeError):
+        statuses = {}
+    prune_statuses()
+
+
+def save_statuses() -> None:
+    with open(STATUSES_FILE, "w", encoding="utf-8") as handle:
+        json.dump(statuses, handle)
+
+
+def prune_statuses() -> None:
+    cutoff = now_ms() - STATUS_TTL_MS
+    expired = [sid for sid, item in statuses.items() if int(item.get("ts") or 0) < cutoff]
+    for sid in expired:
+        item = statuses.pop(sid, None) or {}
+        media_url = item.get("media_url") or ""
+        name = os.path.basename(media_url)
+        path = os.path.join(MEDIA_DIR, name)
+        if name and SAFE_MEDIA_NAME.match(name) and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if expired:
+        save_statuses()
+
+
+def public_status(item: dict, include_views: bool = False) -> dict:
+    data = {
+        "type": "status-new",
+        "id": item.get("id"),
+        "author": item.get("author"),
+        "kind": item.get("kind") or "text",
+        "text": item.get("text") or "",
+        "bg": item.get("bg") or 0xFF075E54,
+        "media_url": item.get("media_url") or "",
+        "ts": item.get("ts"),
+    }
+    if include_views:
+        data["views"] = item.get("views") or []
+    return data
+
+
+async def broadcast_all(message: dict, exclude: Optional[str] = None) -> None:
+    for device_id, websocket in list(connected.items()):
+        if device_id == exclude:
+            continue
+        await send_to_client(websocket, message)
+
+
+class StatusMediaHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print("[HTTP]", fmt % args)
+
+    def do_PUT(self):
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/status-media/"):
+            self.send_error(404)
+            return
+        name = os.path.basename(parsed.path)
+        if not SAFE_MEDIA_NAME.match(name):
+            self.send_error(400)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > 50_000_000:
+            self.send_error(413)
+            return
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        dest = os.path.join(MEDIA_DIR, name)
+        remaining = length
+        with open(dest, "wb") as handle:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                handle.write(chunk)
+                remaining -= len(chunk)
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"url": f"/status-media/{name}"}).encode())
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/status-media/"):
+            self.send_error(404)
+            return
+        name = os.path.basename(parsed.path)
+        path = os.path.join(MEDIA_DIR, name)
+        if not SAFE_MEDIA_NAME.match(name) or not os.path.isfile(path):
+            self.send_error(404)
+            return
+        ctype = "application/octet-stream"
+        if name.endswith(".jpg") or name.endswith(".jpeg"):
+            ctype = "image/jpeg"
+        elif name.endswith(".png"):
+            ctype = "image/png"
+        elif name.endswith(".mp4") or name.endswith(".mov"):
+            ctype = "video/mp4"
+        elif name.endswith(".webm"):
+            ctype = "video/webm"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(os.path.getsize(path)))
+        self.end_headers()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+
+def start_status_http() -> None:
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    server = ThreadingHTTPServer((HOST, HTTP_PORT), StatusMediaHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Status media on http://{HOST}:{HTTP_PORT}")
+
+
+def rooms_of(device_id: str) -> list:
     """Every room `device_id` currently belongs to."""
     return [room_id for room_id, members in rooms.items() if device_id in members]
+
+
+def dm_room(user_a: str, user_b: str) -> str:
+    """Stable 1:1 room id so both phones always land in the same chat."""
+    first, second = sorted([user_a, user_b])
+    return f"dm:{first}:{second}"
+
+
+def other_member(room_id: str, device_id: str) -> Optional[str]:
+    members = rooms.get(room_id, set())
+    others = [member for member in members if member != device_id]
+    return others[0] if others else None
 
 
 async def send_to_client(websocket, message: dict) -> None:
@@ -122,6 +310,37 @@ async def send_to_client(websocket, message: dict) -> None:
         await websocket.send(json.dumps(message))
     except websockets.ConnectionClosed:
         pass
+
+
+async def send_to_device(device_id: str, message: dict) -> bool:
+    target_ws = connected.get(device_id)
+    if target_ws is None:
+        return False
+    await send_to_client(target_ws, message)
+    return True
+
+
+async def deliver_to_peer(sender_id: str, message: dict, peer_id: str = "") -> None:
+    """Send `message` to a specific peer, or to every other member of the
+    sender's rooms if no peer is given. Used for typing so it still works
+    when the in-memory room was lost after a server restart.
+    """
+    targets = set()
+    peer_id = normalize_username(peer_id)
+    if peer_id and peer_id != sender_id:
+        targets.add(peer_id)
+    room_id = message.get("room")
+    if room_id:
+        for member in rooms.get(room_id, set()):
+            if member != sender_id:
+                targets.add(member)
+    if not targets:
+        for room in rooms_of(sender_id):
+            other = other_member(room, sender_id)
+            if other:
+                targets.add(other)
+    for target in targets:
+        await send_to_device(target, message)
 
 
 async def relay_to_room(sender_device_id: str, room_id: str, message: dict) -> None:
@@ -144,16 +363,67 @@ async def relay_to_room(sender_device_id: str, room_id: str, message: dict) -> N
             print(f"[DROP] '{message.get('type')}' for offline device {member_id} in room '{room_id}'")
 
 
-async def handle_register(websocket, device_id: str) -> None:
-    """Bind `websocket` to `device_id`. If that device_id already had a
-    (presumably stale) socket registered, this one replaces it - a phone
-    reconnecting after a network blip doesn't need to do anything special.
+async def handle_register(websocket, device_id: str, returning: bool = False) -> None:
+    """Bind this socket to a unique username.
+
+    A name already claimed by someone else is rejected. Coming back with
+    your own saved username is allowed only while that name is offline.
     """
+    device_id = normalize_username(device_id)
+    if not USERNAME_RE.match(device_id):
+        await send_to_client(websocket, {
+            "type": "error",
+            "message": "Username must be 3-20 letters, numbers, or underscores",
+        })
+        return
+
+    existing_ws = connected.get(device_id)
+    if existing_ws is not None and existing_ws is not websocket:
+        print(f"[TAKEN] Username '{device_id}' is already online")
+        await send_to_client(websocket, {
+            "type": "username-taken",
+            "device_id": device_id,
+        })
+        return
+
+    if device_id in claimed_usernames and not returning:
+        print(f"[TAKEN] Username '{device_id}' is already claimed")
+        await send_to_client(websocket, {
+            "type": "username-taken",
+            "device_id": device_id,
+        })
+        return
+
+    if device_id not in claimed_usernames:
+        claimed_usernames.add(device_id)
+        save_claimed_usernames()
+
     connected[device_id] = websocket
     device_of[websocket] = device_id
     print(f"[REGISTER] {device_id} online")
 
+    await send_to_client(websocket, {
+        "type": "registered",
+        "device_id": device_id,
+    })
+    prune_statuses()
+    await send_to_client(websocket, {
+        "type": "status-list",
+        "items": [
+            public_status(item, include_views=item.get("author") == device_id)
+            for item in statuses.values()
+        ],
+    })
+
     for room_id in rooms_of(device_id):
+        peer_id = other_member(room_id, device_id)
+        if peer_id:
+            await send_to_client(websocket, {
+                "type": "chat-opened",
+                "room": room_id,
+                "peer_id": peer_id,
+                "peer_online": peer_id in connected,
+            })
         await relay_to_room(device_id, room_id, {
             "type": "peer-status",
             "room": room_id,
@@ -189,6 +459,106 @@ async def handle_join(websocket, device_id: str, room_id: str) -> None:
         "device_id": device_id,
         "status": "online",
     })
+
+
+async def handle_open_chat(websocket, device_id: str, peer_id: str) -> None:
+    """Open (or resume) a 1:1 chat between two unique user ids."""
+    peer_id = peer_id.strip()
+    if not peer_id or peer_id == device_id:
+        await send_to_client(websocket, {
+            "type": "error",
+            "message": "Enter another user's username",
+        })
+        return
+
+    room_id = dm_room(device_id, peer_id)
+    rooms[room_id] = {device_id, peer_id}
+    peer_online = peer_id in connected
+    print(f"[CHAT] {device_id} opened chat with {peer_id} ({'online' if peer_online else 'offline'})")
+
+    await send_to_client(websocket, {
+        "type": "joined",
+        "room": room_id,
+        "peer_id": peer_id,
+        "peer_online": peer_online,
+        "member_count": 2 if peer_online else 1,
+    })
+
+    peer_ws = connected.get(peer_id)
+    if peer_ws is not None:
+        await send_to_client(peer_ws, {
+            "type": "chat-opened",
+            "room": room_id,
+            "peer_id": device_id,
+            "peer_online": True,
+        })
+        await send_to_client(peer_ws, {
+            "type": "peer-status",
+            "room": room_id,
+            "device_id": device_id,
+            "status": "online",
+        })
+
+
+async def handle_status_post(sender_id: str, message: dict) -> None:
+    prune_statuses()
+    kind = message.get("kind") or "text"
+    if kind not in ("text", "image", "video"):
+        kind = "text"
+    item = {
+        "id": message.get("id") or f"{sender_id}-{now_ms()}",
+        "author": sender_id,
+        "kind": kind,
+        "text": (message.get("text") or "")[:500],
+        "bg": message.get("bg") or 0xFF075E54,
+        "media_url": message.get("media_url") or "",
+        "ts": message.get("ts") or now_ms(),
+        "views": [],
+    }
+    statuses[item["id"]] = item
+    try:
+        save_statuses()
+    except OSError as exc:
+        print(f"[STATUS] Could not persist status: {exc}")
+    print(f"[STATUS] {sender_id} posted {kind} {item['id']} to {len(connected)} clients")
+    await broadcast_all(public_status(item))
+
+
+async def handle_status_delete(sender_id: str, status_id: str) -> None:
+    item = statuses.get(status_id)
+    if item is None or item.get("author") != sender_id:
+        return
+    statuses.pop(status_id, None)
+    media_url = item.get("media_url") or ""
+    name = os.path.basename(media_url)
+    path = os.path.join(MEDIA_DIR, name)
+    if name and SAFE_MEDIA_NAME.match(name) and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    save_statuses()
+    await broadcast_all({"type": "status-delete", "id": status_id})
+
+
+async def handle_status_view(viewer_id: str, status_id: str) -> None:
+    item = statuses.get(status_id)
+    if item is None or item.get("author") == viewer_id:
+        return
+    views = item.setdefault("views", [])
+    if any(entry.get("viewer") == viewer_id for entry in views):
+        return
+    views.append({"viewer": viewer_id, "ts": now_ms()})
+    save_statuses()
+    author_ws = connected.get(item.get("author"))
+    if author_ws is not None:
+        await send_to_client(author_ws, {
+            "type": "status-viewed",
+            "id": status_id,
+            "viewer": viewer_id,
+            "views": views,
+        })
+        print(f"[STATUS] {viewer_id} viewed {status_id}")
 
 
 async def handle_leave(device_id: str, room_id: str) -> None:
@@ -263,9 +633,13 @@ async def handle_connection(websocket) -> None:
             message_type = message.get("type")
 
             if message_type == "register":
-                device_id = message.get("device_id")
+                device_id = message.get("device_id") or message.get("username")
                 if device_id:
-                    await handle_register(websocket, device_id)
+                    await handle_register(
+                        websocket,
+                        device_id,
+                        returning=bool(message.get("returning")),
+                    )
                 else:
                     print("[ERROR] 'register' message missing 'device_id' field")
                 continue
@@ -277,7 +651,14 @@ async def handle_connection(websocket) -> None:
                 print(f"[ERROR] Got '{message_type}' from an unregistered socket")
                 continue
 
-            if message_type == "join":
+            if message_type == "open-chat":
+                peer_id = normalize_username(message.get("peer_id") or "")
+                if peer_id:
+                    await handle_open_chat(websocket, sender_device_id, peer_id)
+                else:
+                    print("[ERROR] 'open-chat' message missing 'peer_id' field")
+
+            elif message_type == "join":
                 room_id = message.get("room")
                 if room_id:
                     await handle_join(websocket, sender_device_id, room_id)
@@ -289,8 +670,41 @@ async def handle_connection(websocket) -> None:
                 if room_id:
                     await handle_leave(sender_device_id, room_id)
 
+            elif message_type == "status-post":
+                await handle_status_post(sender_device_id, message)
+
+            elif message_type == "status-delete":
+                status_id = message.get("id")
+                if status_id:
+                    await handle_status_delete(sender_device_id, status_id)
+
+            elif message_type == "status-view":
+                status_id = message.get("id")
+                if status_id:
+                    await handle_status_view(sender_device_id, status_id)
+
+            elif message_type == "status-request":
+                prune_statuses()
+                await send_to_client(websocket, {
+                    "type": "status-list",
+                    "items": [
+                        public_status(item, include_views=item.get("author") == sender_device_id)
+                        for item in statuses.values()
+                    ],
+                })
+
+            elif message_type == "typing":
+                message["device_id"] = sender_device_id
+                await deliver_to_peer(
+                    sender_device_id,
+                    message,
+                    peer_id=message.get("peer_id") or "",
+                )
+
             elif message_type in (
                 "chat",
+                "chat-delivered",
+                "chat-read",
                 "call-invite",
                 "call-accept",
                 "call-decline",
@@ -335,6 +749,30 @@ async def handle_connection(websocket) -> None:
 # hands us the sender's address for free, so the client can do the same
 # trick in reverse to learn ours.
 
+def lan_ipv4_addresses():
+    """IPv4 addresses phones on this LAN can use to reach this machine."""
+    found = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        found.append(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                found.append(ip)
+    except OSError:
+        pass
+    unique = []
+    for ip in found:
+        if ip not in unique:
+            unique.append(ip)
+    return unique
+
+
 class DiscoveryProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport):
         self.transport = transport
@@ -346,16 +784,22 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
             return
 
         if message.get("type") == "discover":
+            hosts = lan_ipv4_addresses()
             reply = json.dumps({
                 "type": "discover-reply",
                 "ws_port": PORT,
                 "server_name": socket.gethostname(),
+                "host": hosts[0] if hosts else addr[0],
+                "hosts": hosts,
             })
             self.transport.sendto(reply.encode("utf-8"), addr)
-            print(f"[DISCOVERY] Replied to {addr}")
+            print(f"[DISCOVERY] Replied to {addr} with hosts={hosts}")
 
 
 async def main() -> None:
+    load_claimed_usernames()
+    load_statuses()
+    start_status_http()
     loop = asyncio.get_running_loop()
 
     await loop.create_datagram_endpoint(
