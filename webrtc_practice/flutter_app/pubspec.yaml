@@ -51,7 +51,9 @@ dependencies:
   # background service / notifications
   flutter_foreground_task: ^9.0.0
   flutter_local_notifications: ^22.0.0
-  permission_handler: ^13.0.0
+  # 13.x+ pulls permission_handler_android 14.1.0, which requires Flutter 3.44's
+  # built-in Kotlin. This app is on Flutter 3.41.9.
+  permission_handler: ^12.0.1
 
   # ringing
   audioplayers: ^6.0.0
@@ -79,8 +81,8 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  assets:
-    - assets/sounds/ringtone.wav
+  #assets:
+  #assets/sounds/ringtone.wav
 
   # To add assets to your application, add an assets section, like this:
   # assets:

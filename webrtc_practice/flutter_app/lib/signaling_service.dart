@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 /// SignalingService
@@ -55,6 +57,8 @@ class SignalingService {
   // --- WebSocket (signaling) ---------------------------------------------
 
   WebSocketChannel? _channel;
+  String? _deviceId;
+  bool _isOfferer = false;
 
   /// UI callback so `CallScreen` can show a human-readable status string
   /// ("Waiting for peer...", "Connecting...", etc) as the handshake
@@ -91,21 +95,30 @@ class SignalingService {
 
     await _openLocalCamera();
     await _createPeerConnection();
-    _connectToSignalingServer();
-
-    onStatusChange?.call('Connecting to signaling server...');
+    await _connectToSignalingServer();
   }
 
   // ------------------------------------------------------------------
   // STEP 1: connect to the Python signaling server over WebSocket.
   // ------------------------------------------------------------------
 
-  /// Opens a WebSocket connection to `ws://<serverIp>:<serverPort>` and
-  /// immediately sends a "join" message for our room. From this point on,
-  /// every message we receive is handed to [_handleSignalingMessage].
-  void _connectToSignalingServer() {
+  /// Opens a WebSocket to `ws://<serverIp>:<serverPort>`, registers a
+  /// stable device_id (required by the v2 server), then joins the room.
+  Future<void> _connectToSignalingServer() async {
+    onStatusChange?.call('Connecting to signaling server...');
+
+    _deviceId = await _loadOrCreateDeviceId();
     final uri = Uri.parse('ws://$serverIp:$serverPort');
     _channel = WebSocketChannel.connect(uri);
+
+    try {
+      await _channel!.ready;
+    } catch (_) {
+      onStatusChange?.call(
+        'Could not reach $serverIp:$serverPort. Is server.py running?',
+      );
+      return;
+    }
 
     _channel!.stream.listen(
       (raw) {
@@ -116,14 +129,30 @@ class SignalingService {
       onError: (_) => onStatusChange?.call('Signaling connection error'),
     );
 
-    _sendMessage({'type': 'join', 'room': room});
+    _sendMessage({'type': 'register', 'device_id': _deviceId});
+    _sendMessage({'type': 'join', 'room': room, 'device_id': _deviceId});
+  }
+
+  Future<String> _loadOrCreateDeviceId() async {
+    final prefs = await SharedPreferences.getInstance();
+    const key = 'webrtc_device_id';
+    final existing = prefs.getString(key);
+    if (existing != null && existing.isNotEmpty) return existing;
+
+    final created = const Uuid().v4();
+    await prefs.setString(key, created);
+    return created;
   }
 
   /// Small helper: JSON-encode a message and send it over the WebSocket.
   /// Every message we send always includes "room" so the server knows
   /// which pair of clients to relay it between.
   void _sendMessage(Map<String, dynamic> message) {
-    _channel?.sink.add(jsonEncode({...message, 'room': room}));
+    _channel?.sink.add(jsonEncode({
+      ...message,
+      'room': room,
+      if (_deviceId != null) 'device_id': _deviceId,
+    }));
   }
 
   // ------------------------------------------------------------------
@@ -160,6 +189,7 @@ class SignalingService {
     pc.onTrack = (RTCTrackEvent event) {
       if (event.streams.isNotEmpty) {
         remoteRenderer.srcObject = event.streams.first;
+        onStatusChange?.call('Remote video connected');
       }
     };
 
@@ -201,35 +231,40 @@ class SignalingService {
     if (pc == null) return;
 
     switch (message['type']) {
-      // The server tells us how many clients (including us) are now in
-      // the room. We don't act on this ourselves - we just wait to see
-      // if a "peer-joined" message arrives next.
       case 'joined':
-        final peerCount = message['peer_count'] as int? ?? 1;
-        onStatusChange?.call('Joined room ($peerCount/2). Waiting for peer...');
+        final memberCount =
+            message['member_count'] as int? ?? message['peer_count'] as int? ?? 1;
+        if (memberCount >= 2) {
+          // The other phone is already a member; they will send the offer
+          // after receiving our peer-status.
+          onStatusChange?.call('Joined room ($memberCount/2). Waiting for offer...');
+        } else {
+          onStatusChange?.call('Joined room ($memberCount/2). Waiting for peer...');
+        }
         break;
 
-      // ------------------------------------------------------------
-      // STEP 4: we were already waiting in the room, and a second
-      // client just joined -> WE are the "first" peer, so WE create
-      // the offer.
-      // ------------------------------------------------------------
+      // Server v2 notifies existing members this way when the other
+      // phone joins or reconnects. The peer already in the room is
+      // the offerer.
+      case 'peer-status':
+        final status = message['status'] as String?;
+        final otherId = message['device_id'] as String?;
+        if (otherId != null && otherId == _deviceId) break;
+        if (status == 'online' && !_remoteDescriptionSet && !_isOfferer) {
+          await _createAndSendOffer(pc);
+        } else if (status == 'offline') {
+          onStatusChange?.call('Peer disconnected');
+          remoteRenderer.srcObject = null;
+          _remoteDescriptionSet = false;
+          _isOfferer = false;
+          _pendingCandidates.clear();
+        }
+        break;
+
       case 'peer-joined':
-        onStatusChange?.call('Peer joined - creating offer...');
-
-        // Ask WebRTC to generate an SDP offer describing our audio/video
-        // capabilities.
-        final RTCSessionDescription offer = await pc.createOffer();
-
-        // `setLocalDescription` tells our OWN peer connection "this is
-        // the offer I'm sending" - required before we can send it.
-        await pc.setLocalDescription(offer);
-
-        // Send it to the other peer through the signaling server.
-        _sendMessage({
-          'type': 'offer',
-          'sdp': {'type': offer.type, 'sdp': offer.sdp},
-        });
+        if (!_remoteDescriptionSet && !_isOfferer) {
+          await _createAndSendOffer(pc);
+        }
         break;
 
       // ------------------------------------------------------------
@@ -277,11 +312,12 @@ class SignalingService {
       // WebRTC can try connecting through it.
       // ------------------------------------------------------------
       case 'ice-candidate':
-        final candidateData = message['candidate'] as Map<String, dynamic>;
+        final candidateData = message['candidate'] as Map<String, dynamic>?;
+        if (candidateData == null) break;
         final candidate = RTCIceCandidate(
           candidateData['candidate'] as String?,
           candidateData['sdpMid'] as String?,
-          candidateData['sdpMLineIndex'] as int?,
+          (candidateData['sdpMLineIndex'] as num?)?.toInt(),
         );
 
         if (_remoteDescriptionSet) {
@@ -297,6 +333,7 @@ class SignalingService {
         onStatusChange?.call('Peer disconnected');
         remoteRenderer.srcObject = null;
         _remoteDescriptionSet = false;
+        _isOfferer = false;
         _pendingCandidates.clear();
         break;
 
@@ -304,6 +341,17 @@ class SignalingService {
         onStatusChange?.call('Room is full (2 peers already connected)');
         break;
     }
+  }
+
+  Future<void> _createAndSendOffer(RTCPeerConnection pc) async {
+    _isOfferer = true;
+    onStatusChange?.call('Peer joined - creating offer...');
+    final RTCSessionDescription offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    _sendMessage({
+      'type': 'offer',
+      'sdp': {'type': offer.type, 'sdp': offer.sdp},
+    });
   }
 
   /// Applies any ICE candidates that arrived before we finished

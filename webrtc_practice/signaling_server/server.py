@@ -181,6 +181,15 @@ async def handle_join(websocket, device_id: str, room_id: str) -> None:
         "member_count": len(members),
     })
 
+    # Existing members need to know someone just joined so they can
+    # start the WebRTC offer/answer handshake.
+    await relay_to_room(device_id, room_id, {
+        "type": "peer-status",
+        "room": room_id,
+        "device_id": device_id,
+        "status": "online",
+    })
+
 
 async def handle_leave(device_id: str, room_id: str) -> None:
     """Explicitly remove `device_id` from a room's membership. Unlike v1,
